@@ -13,7 +13,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeMutationEntry.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeAddress.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQuorumAddedParts.h>
-#include <Storages/MergeTree/ReplicatedMergeTreeColumnsHash.h>
+#include <Storages/MergeTree/ReplicatedMergeTreePartHeader.h>
 
 #include <Databases/IDatabase.h>
 
@@ -707,18 +707,18 @@ void StorageReplicatedMergeTree::checkPartChecksumsAndAddCommitOps(const zkutil:
     check(part->columns);
     int expected_columns_version = columns_version;
 
+    auto local_part_header = ReplicatedMergeTreePartHeader::fromPart(part->columns, part->checksums);
+
     Strings replicas = zookeeper->getChildren(zookeeper_path + "/replicas");
     std::shuffle(replicas.begin(), replicas.end(), rng);
-    auto expected_columns_hash = ReplicatedMergeTreeColumnsHash::fromColumns(part->columns);
-    bool has_been_alredy_added = false;
+    bool has_been_already_added = false;
 
     for (const String & replica : replicas)
     {
-        Coordination::Stat stat_before, stat_after;
         String current_part_path = zookeeper_path + "/replicas/" + replica + "/parts/" + part_name;
 
-        String columns_str;
-        if (!zookeeper->tryGet(current_part_path + "/columns", columns_str, &stat_before))
+        String part_zk_str;
+        if (!zookeeper->tryGet(current_part_path, part_zk_str))
         {
             if (absent_replicas_paths)
                 absent_replicas_paths->emplace(current_part_path);
@@ -726,30 +726,41 @@ void StorageReplicatedMergeTree::checkPartChecksumsAndAddCommitOps(const zkutil:
             continue;
         }
 
-        if (ReplicatedMergeTreeColumnsHash::fromZNode(columns_str) != expected_columns_hash)
+        ReplicatedMergeTreePartHeader replica_part_header;
+        if (!part_zk_str.empty())
+            replica_part_header = ReplicatedMergeTreePartHeader::fromString(part_zk_str);
+        else
+        {
+            Coordination::Stat columns_stat_before, columns_stat_after;
+            String columns_str;
+            String checksums_str;
+            /// Let's check that the node's version with the columns did not change while we were reading the checksums.
+            /// This ensures that the columns and the checksum refer to the same data.
+            if (!zookeeper->tryGet(current_part_path + "/columns", columns_str, &columns_stat_before) ||
+                !zookeeper->tryGet(current_part_path + "/checksums", checksums_str) ||
+                !zookeeper->exists(current_part_path + "/columns", &columns_stat_after) ||
+                columns_stat_before.version != columns_stat_after.version)
+            {
+                LOG_INFO(log, "Not checking checksums of part " << part_name << " with replica " << replica
+                    << " because part changed while we were reading its checksums");
+                continue;
+            }
+
+            replica_part_header = ReplicatedMergeTreePartHeader::fromColumnsAndChecksumsZNodes(
+                columns_str, checksums_str);
+        }
+
+        if (replica_part_header.getColumnsHash() != local_part_header.getColumnsHash())
         {
             LOG_INFO(log, "Not checking checksums of part " << part_name << " with replica " << replica
                 << " because columns are different");
             continue;
         }
 
-        String checksums_str;
-        /// Let's check that the node's version with the columns did not change while we were reading the checksums.
-        /// This ensures that the columns and the checksum refer to the same data.
-        if (!zookeeper->tryGet(current_part_path + "/checksums", checksums_str) ||
-            !zookeeper->exists(current_part_path + "/columns", &stat_after) ||
-            stat_before.version != stat_after.version)
-        {
-            LOG_INFO(log, "Not checking checksums of part " << part_name << " with replica " << replica
-                << " because part changed while we were reading its checksums");
-            continue;
-        }
-
-        auto zk_checksums = MinimalisticDataPartChecksums::deserializeFrom(checksums_str);
-        zk_checksums.checkEqual(part->checksums, true);
+        replica_part_header.getChecksums().checkEqual(local_part_header.getChecksums(), true);
 
         if (replica == replica_name)
-            has_been_alredy_added = true;
+            has_been_already_added = true;
 
         /// If we verify checksums in "sequential manner" (i.e. recheck absence of checksums on other replicas when commit)
         /// then it is enough to verify checksums on at least one replica since checksums on other replicas must be the same.
@@ -760,18 +771,27 @@ void StorageReplicatedMergeTree::checkPartChecksumsAndAddCommitOps(const zkutil:
         }
     }
 
-    if (!has_been_alredy_added)
+    if (!has_been_already_added)
     {
         String part_path = replica_path + "/parts/" + part_name;
 
         ops.emplace_back(zkutil::makeCheckRequest(
             zookeeper_path + "/columns", expected_columns_version));
-        ops.emplace_back(zkutil::makeCreateRequest(
-            part_path, "", zkutil::CreateMode::Persistent));
-        ops.emplace_back(zkutil::makeCreateRequest(
-            part_path + "/columns", expected_columns_hash.toString(), zkutil::CreateMode::Persistent));
-        ops.emplace_back(zkutil::makeCreateRequest(
-            part_path + "/checksums", getChecksumsForZooKeeper(part->checksums), zkutil::CreateMode::Persistent));
+
+        if (data.settings.use_minimalistic_part_header_in_zookeeper)
+        {
+            ops.emplace_back(zkutil::makeCreateRequest(
+                part_path, local_part_header.toString(), zkutil::CreateMode::Persistent));
+        }
+        else
+        {
+            ops.emplace_back(zkutil::makeCreateRequest(
+                part_path, "", zkutil::CreateMode::Persistent));
+            ops.emplace_back(zkutil::makeCreateRequest(
+                part_path + "/columns", part->columns.toString(), zkutil::CreateMode::Persistent));
+            ops.emplace_back(zkutil::makeCreateRequest(
+                part_path + "/checksums", getChecksumsForZooKeeper(part->checksums), zkutil::CreateMode::Persistent));
+        }
     }
     else
     {
@@ -1511,12 +1531,25 @@ void StorageReplicatedMergeTree::executeClearColumnInPartition(const LogEntry & 
 
         /// Update part metadata in ZooKeeper.
         Coordination::Requests ops;
-        ops.emplace_back(zkutil::makeSetRequest(
-            replica_path + "/parts/" + part->name + "/columns",
-            ReplicatedMergeTreeColumnsHash::fromColumns(transaction->getNewColumns()).toString(),
-            -1));
-        ops.emplace_back(zkutil::makeSetRequest(
-            replica_path + "/parts/" + part->name + "/checksums", getChecksumsForZooKeeper(transaction->getNewChecksums()), -1));
+        if (data.settings.use_minimalistic_part_header_in_zookeeper)
+        {
+            auto new_part_header = ReplicatedMergeTreePartHeader::fromPart(
+                transaction->getNewColumns(), transaction->getNewChecksums());
+            ops.emplace_back(zkutil::makeSetRequest(
+                replica_path + "/parts/" + part->name,
+                new_part_header.toString(),
+                -1));
+        }
+        else
+        {
+            ops.emplace_back(zkutil::makeSetRequest(
+                replica_path + "/parts/" + part->name + "/columns",
+                transaction->getNewColumns().toString(),
+                -1));
+            ops.emplace_back(zkutil::makeSetRequest(
+                replica_path + "/parts/" + part->name + "/checksums", getChecksumsForZooKeeper(transaction->getNewChecksums()),
+                -1));
+        }
 
         zookeeper->multi(ops);
 
@@ -4785,18 +4818,29 @@ void StorageReplicatedMergeTree::getCommitPartOps(
     ops.emplace_back(zkutil::makeCheckRequest(
         zookeeper_path + "/columns",
         columns_version));
-    ops.emplace_back(zkutil::makeCreateRequest(
-        replica_path + "/parts/" + part->name,
-        "",
-        zkutil::CreateMode::Persistent));
-    ops.emplace_back(zkutil::makeCreateRequest(
-        replica_path + "/parts/" + part->name + "/columns",
-        ReplicatedMergeTreeColumnsHash::fromColumns(part->columns).toString(),
-        zkutil::CreateMode::Persistent));
-    ops.emplace_back(zkutil::makeCreateRequest(
-        replica_path + "/parts/" + part->name + "/checksums",
-        getChecksumsForZooKeeper(part->checksums),
-        zkutil::CreateMode::Persistent));
+
+    if (data.settings.use_minimalistic_part_header_in_zookeeper)
+    {
+        ops.emplace_back(zkutil::makeCreateRequest(
+            replica_path + "/parts/" + part->name,
+            ReplicatedMergeTreePartHeader::fromPart(part->columns, part->checksums).toString(),
+            zkutil::CreateMode::Persistent));
+    }
+    else
+    {
+        ops.emplace_back(zkutil::makeCreateRequest(
+            replica_path + "/parts/" + part->name,
+            "",
+            zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(
+            replica_path + "/parts/" + part->name + "/columns",
+            part->columns.toString(),
+            zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(
+            replica_path + "/parts/" + part->name + "/checksums",
+            getChecksumsForZooKeeper(part->checksums),
+            zkutil::CreateMode::Persistent));
+    }
 }
 
 ReplicatedMergeTreeAddress StorageReplicatedMergeTree::getReplicatedMergeTreeAddress() const

@@ -120,15 +120,17 @@ struct MinimalisticDataPartChecksums
     void computeTotalChecksums(const MergeTreeDataPartChecksums & full_checksums);
 
     bool deserialize(ReadBuffer & in);
+    void deserializeWithoutHeader(ReadBuffer & in);
     static MinimalisticDataPartChecksums deserializeFrom(const String & s);
 
     void serialize(WriteBuffer & to) const;
+    void serializeWithoutHeader(WriteBuffer & to) const;
     String getSerializedString();
     static String getSerializedString(const MergeTreeDataPartChecksums & full_checksums, bool minimalistic);
 
-    void checkEqual(const MinimalisticDataPartChecksums & rhs, bool check_uncompressed_hash_in_compressed_files);
-    void checkEqual(const MergeTreeDataPartChecksums & rhs, bool check_uncompressed_hash_in_compressed_files);
-    void checkEqualImpl(const MinimalisticDataPartChecksums & rhs, bool check_uncompressed_hash_in_compressed_files);
+    void checkEqual(const MinimalisticDataPartChecksums & rhs, bool check_uncompressed_hash_in_compressed_files) const;
+    void checkEqual(const MergeTreeDataPartChecksums & rhs, bool check_uncompressed_hash_in_compressed_files) const;
+    void checkEqualImpl(const MinimalisticDataPartChecksums & rhs, bool check_uncompressed_hash_in_compressed_files) const;
 };
 
 
